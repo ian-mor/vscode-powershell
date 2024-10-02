@@ -89,6 +89,7 @@ export class SessionManager implements Middleware {
     private sessionDetails: IEditorServicesSessionDetails | undefined;
     private sessionsFolder: vscode.Uri;
     private sessionStatus: SessionStatus = SessionStatus.NotStarted;
+    private shellIntegrationEnabled = false;
     private startCancellationTokenSource: vscode.CancellationTokenSource | undefined;
     private suppressRestartPrompt = false;
     private versionDetails: IPowerShellVersionDetails | undefined;
@@ -109,6 +110,7 @@ export class SessionManager implements Middleware {
         // We have to override the scheme because it defaults to
         // 'vscode-userdata' which breaks UNC paths.
         this.sessionsFolder = vscode.Uri.joinPath(extensionContext.globalStorageUri.with({ scheme: "file" }), "sessions");
+
         this.platformDetails = getPlatformDetails();
         this.HostName = hostName;
         this.DisplayName = displayName;
@@ -188,6 +190,9 @@ export class SessionManager implements Middleware {
 
         // Migrate things.
         await this.migrateWhitespaceAroundPipeSetting();
+
+        // Update non-PowerShell settings.
+        this.shellIntegrationEnabled = vscode.workspace.getConfiguration("terminal.integrated.shellIntegration").get<boolean>("enabled") ?? false;
 
         // Find the PowerShell executable to use for the server.
         this.PowerShellExeDetails = await this.findPowerShell();
@@ -303,6 +308,13 @@ export class SessionManager implements Middleware {
         return this.sessionDetails;
     }
 
+    public async getLanguageServerPid(): Promise<number | undefined> {
+        if (this.languageServerProcess === undefined) {
+            void this.logger.writeAndShowError("PowerShell Extension Terminal unavailable!");
+        }
+        return this.languageServerProcess?.getPid();
+    }
+
     public getPowerShellVersionDetails(): IPowerShellVersionDetails | undefined {
         return this.versionDetails;
     }
@@ -325,7 +337,7 @@ export class SessionManager implements Middleware {
         this.debugEventHandler?.dispose();
 
         if (this.PowerShellExeDetails === undefined) {
-            return Promise.reject("Required PowerShellExeDetails undefined!");
+            return Promise.reject(new Error("Required PowerShellExeDetails undefined!"));
         }
 
         // TODO: It might not be totally necessary to update the session
@@ -338,7 +350,7 @@ export class SessionManager implements Middleware {
             new PowerShellProcess(
                 this.PowerShellExeDetails.exePath,
                 bundledModulesPath,
-                "[TEMP] PowerShell Extension",
+                true,
                 this.logger,
                 this.getEditorServicesArgs(bundledModulesPath, this.PowerShellExeDetails) + "-DebugServiceOnly ",
                 this.getNewSessionFilePath(),
@@ -440,18 +452,23 @@ export class SessionManager implements Middleware {
 
     private async onConfigurationUpdated(): Promise<void> {
         const settings = getSettings();
+        const shellIntegrationEnabled = vscode.workspace.getConfiguration("terminal.integrated.shellIntegration").get<boolean>("enabled");
         this.logger.updateLogLevel(settings.developer.editorServicesLogLevel);
 
         // Detect any setting changes that would affect the session.
-        if (!this.suppressRestartPrompt && this.sessionStatus === SessionStatus.Running &&
-            (settings.cwd !== this.sessionSettings.cwd
-                || settings.powerShellDefaultVersion !== this.sessionSettings.powerShellDefaultVersion
-                || settings.developer.editorServicesLogLevel !== this.sessionSettings.developer.editorServicesLogLevel
-                || settings.developer.bundledModulesPath !== this.sessionSettings.developer.bundledModulesPath
-                || settings.developer.editorServicesWaitForDebugger !== this.sessionSettings.developer.editorServicesWaitForDebugger
-                || settings.integratedConsole.useLegacyReadLine !== this.sessionSettings.integratedConsole.useLegacyReadLine
-                || settings.integratedConsole.startInBackground !== this.sessionSettings.integratedConsole.startInBackground
-                || settings.integratedConsole.startLocation !== this.sessionSettings.integratedConsole.startLocation)) {
+        if (!this.suppressRestartPrompt
+            && this.sessionStatus === SessionStatus.Running
+            && ((shellIntegrationEnabled !== this.shellIntegrationEnabled
+                && !settings.integratedConsole.startInBackground)
+            || settings.cwd !== this.sessionSettings.cwd
+            || settings.powerShellDefaultVersion !== this.sessionSettings.powerShellDefaultVersion
+            || settings.developer.editorServicesLogLevel !== this.sessionSettings.developer.editorServicesLogLevel
+            || settings.developer.bundledModulesPath !== this.sessionSettings.developer.bundledModulesPath
+            || settings.developer.editorServicesWaitForDebugger !== this.sessionSettings.developer.editorServicesWaitForDebugger
+            || settings.developer.setExecutionPolicy !== this.sessionSettings.developer.setExecutionPolicy
+            || settings.integratedConsole.useLegacyReadLine !== this.sessionSettings.integratedConsole.useLegacyReadLine
+            || settings.integratedConsole.startInBackground !== this.sessionSettings.integratedConsole.startInBackground
+            || settings.integratedConsole.startLocation !== this.sessionSettings.integratedConsole.startLocation)) {
 
             this.logger.writeVerbose("Settings changed, prompting to restart...");
             const response = await vscode.window.showInformationMessage(
@@ -470,12 +487,7 @@ export class SessionManager implements Middleware {
             vscode.commands.registerCommand(this.ShowSessionMenuCommandName, async () => { await this.showSessionMenu(); }),
             vscode.workspace.onDidChangeConfiguration(async () => { await this.onConfigurationUpdated(); }),
             vscode.commands.registerCommand(
-                "PowerShell.ShowSessionConsole", (isExecute?: boolean) => { this.showSessionTerminal(isExecute); }),
-            vscode.commands.registerCommand(
-                "PowerShell.WalkthroughTelemetry", (satisfaction: number) => {
-                    this.sendTelemetryEvent("powershellWalkthroughSatisfaction", undefined, { level: satisfaction });
-                }
-            )
+                "PowerShell.ShowSessionConsole", (isExecute?: boolean) => { this.showSessionTerminal(isExecute); })
         ];
     }
 
@@ -516,26 +528,31 @@ export class SessionManager implements Middleware {
         cancellationToken: vscode.CancellationToken): Promise<PowerShellProcess> {
 
         const bundledModulesPath = await this.getBundledModulesPath();
+
+        // Dispose any stale terminals from previous killed sessions.
+        PowerShellProcess.cleanUpTerminals();
         const languageServerProcess =
             new PowerShellProcess(
                 powerShellExeDetails.exePath,
                 bundledModulesPath,
-                "PowerShell Extension",
+                false,
                 this.logger,
                 this.getEditorServicesArgs(bundledModulesPath, powerShellExeDetails),
                 this.getNewSessionFilePath(),
                 this.sessionSettings);
 
         languageServerProcess.onExited(
-            async () => {
+            () => {
+                LanguageClientConsumer.onLanguageClientExited();
+
                 if (this.sessionStatus === SessionStatus.Running
                     || this.sessionStatus === SessionStatus.Busy) {
                     this.setSessionStatus("Session Exited!", SessionStatus.Failed);
-                    await this.promptForRestart();
+                    void this.promptForRestart();
                 }
             });
 
-        this.sessionDetails = await languageServerProcess.start("EditorServices", cancellationToken);
+        this.sessionDetails = await languageServerProcess.start(cancellationToken);
 
         return languageServerProcess;
     }
@@ -605,6 +622,7 @@ export class SessionManager implements Middleware {
                 });
         };
 
+
         const clientOptions: LanguageClientOptions = {
             documentSelector: this.documentSelector,
             synchronize: {
@@ -614,10 +632,13 @@ export class SessionManager implements Middleware {
                 // TODO: fileEvents: vscode.workspace.createFileSystemWatcher('**/.eslintrc')
             },
             // NOTE: Some settings are only applicable on startup, so we send them during initialization.
+            // When Terminal Shell Integration is enabled, we pass the path to the script that the server should execute.
+            // Passing an empty string implies integration is disabled.
             initializationOptions: {
                 enableProfileLoading: this.sessionSettings.enableProfileLoading,
                 initialWorkingDirectory: await validateCwdSetting(this.logger),
-                shellIntegrationEnabled: vscode.workspace.getConfiguration("terminal.integrated.shellIntegration").get<boolean>("enabled"),
+                shellIntegrationScript: this.shellIntegrationEnabled
+                    ? utils.ShellIntegrationScript : "",
             },
             errorHandler: {
                 // Override the default error handler to prevent it from
@@ -639,12 +660,14 @@ export class SessionManager implements Middleware {
             middleware: this,
         };
 
-        const languageClient = new LanguageClient("PowerShell Editor Services", connectFunc, clientOptions);
+        const languageClient = new LanguageClient("powershell", "PowerShell Editor Services Client", connectFunc, clientOptions);
 
         // This enables handling Semantic Highlighting messages in PowerShell Editor Services
         // TODO: We should only turn this on in preview.
         languageClient.registerProposedFeatures();
 
+        // NOTE: We don't currently send any events from PSES, but may again in
+        // the future so we're leaving this side wired up.
         languageClient.onTelemetry((event) => {
             const eventName: string = event.eventName ? event.eventName : "PSESEvent";
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -656,7 +679,7 @@ export class SessionManager implements Middleware {
         // so that they can register their message handlers
         // before the connection is established.
         for (const consumer of this.languageClientConsumers) {
-            consumer.setLanguageClient(languageClient);
+            consumer.onLanguageClientSet(languageClient);
         }
 
         this.registeredHandlers = [
@@ -679,6 +702,7 @@ export class SessionManager implements Middleware {
 
         try {
             await languageClient.start();
+            LanguageClientConsumer.onLanguageClientStarted(languageClient);
         } catch (err) {
             void this.setSessionFailedOpenBug("Language client failed to start: " + (err instanceof Error ? err.message : "unknown"));
         }
@@ -711,7 +735,6 @@ export class SessionManager implements Middleware {
             "-HostName 'Visual Studio Code Host' " +
             "-HostProfileId 'Microsoft.VSCode' " +
             `-HostVersion '${this.HostVersion}' ` +
-            "-AdditionalModules @('PowerShellEditorServices.VSCode') " +
             `-BundledModulesPath '${utils.escapeSingleQuotes(bundledModulesPath)}' ` +
             "-EnableConsoleRepl ";
 
@@ -753,6 +776,8 @@ Type 'help' to get help.
         const versionDetails = await this.languageClient?.sendRequest(
             PowerShellVersionRequestType, timeout.token);
 
+        // This is pretty much the only telemetry event we care about.
+        // TODO: We actually could send this earlier from PSES itself.
         this.sendTelemetryEvent("powershellVersionCheck",
             { powershellVersion: versionDetails?.version ?? "unknown" });
 
